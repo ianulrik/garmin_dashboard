@@ -1,0 +1,18 @@
+[project]
+name = "garmin-dashboard"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ianulrik", email = "ianulrik03@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "garminconnect>=0.3.15",
+    "garth>=0.8.0",
+    "pandas>=3.0.5",
+    "streamlit>=1.63.0",
+]
+
+[tool.uv]
+package = false
