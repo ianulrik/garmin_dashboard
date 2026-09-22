@@ -33,7 +33,7 @@ def handle_garmin_errors(func):
             st.error(
                 "**Klarte ikke hente data fra Garmin Connect.**\n\n"
                 f"Feil: {e}\n\n"
-                "Kjør trolig `uv run python -m garmin_mcp.auth` i `garmin_mcp`-prosjektet "
+                "Kjør trolig `uv run python -m garmin_mcp.auth` i `garmin_mcp`-utvikler "
                 "for å friske opp innloggingen, og last siden på nytt."
             )
             st.stop()
