@@ -172,6 +172,7 @@ def get_sleep_trend(days: int = 14) -> list[dict]:
             "timer": round((r.get("values") or {}).get("totalSleepTimeInSeconds", 0) / 3600, 2),
             "score": (r.get("values") or {}).get("sleepScore"),
             "kvalitet": (r.get("values") or {}).get("sleepScoreQuality"),
+            "spo2": (r.get("values") or {}).get("spO2"),
         }
         for r in rows
     ]

@@ -233,11 +233,16 @@ def render() -> None:
         st.write(f"**REM-søvn:** {sovn.get('rem_min', 0):.0f} min")
         st.write(f"**Våken:** {sovn.get('vaken_min', 0):.0f} min ({sovn.get('antall_oppvakninger', 0)} oppvåkninger)")
         st.write(f"**Snitt søvnstress:** {sovn.get('snitt_stress') or '—'}")
-        if sovn.get("spo2_snitt"):
-            st.write(
-                f"**SpO2:** snitt {sovn['spo2_snitt']:.0f} %, laveste {sovn.get('spo2_laveste') or '—'} %, "
-                f"høyeste {sovn.get('spo2_hoyeste') or '—'} %"
-            )
+        spo2_nights = [n["spo2"] for n in sleep_trend if n.get("spo2")]
+        spo2_30d = sum(spo2_nights) / len(spo2_nights) if spo2_nights else None
+        spo2_col1, spo2_col2 = st.columns(2)
+        spo2_col1.metric(
+            "SpO2 snitt sist natt",
+            f"{sovn['spo2_snitt']:.1f} %" if sovn.get("spo2_snitt") else "—",
+            f"{sovn['spo2_snitt'] - spo2_30d:+.1f} mot 30-dagerssnitt" if sovn.get("spo2_snitt") and spo2_30d else None,
+            delta_color="off",
+        )
+        spo2_col2.metric("SpO2 snitt siste 30 dager", f"{spo2_30d:.1f} %" if spo2_30d else "—")
 
     with sleep_col2:
         sleep_df = pd.DataFrame(sleep_trend).set_index("dato")
