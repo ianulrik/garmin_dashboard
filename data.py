@@ -7,7 +7,7 @@ resultatet i minnet i et gitt tidsrom, så data faktisk kun hentes på nytt
 periodisk (matcher "periodisk oppdaterte data", ikke sanntid).
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import streamlit as st
 
@@ -62,6 +62,18 @@ def get_health_snapshot() -> dict:
 
     next_need = dto.get("nextSleepNeed") or {}
 
+    # SpO2-målinger per minutt gjennom natta. Tidsstemplene er i GMT — forskyv
+    # med søvnøktens egen lokal/GMT-differanse, så grafen viser klokkeslett lokalt.
+    tz_offset_ms = (dto.get("sleepStartTimestampLocal") or 0) - (dto.get("sleepStartTimestampGMT") or 0)
+    spo2_night = [
+        {
+            "tid": (datetime.fromisoformat(e["epochTimestamp"]) + timedelta(milliseconds=tz_offset_ms)).isoformat(),
+            "spo2": e["spo2Reading"],
+        }
+        for e in sleep_raw.get("wellnessEpochSPO2DataDTOList") or []
+        if e.get("epochTimestamp") and e.get("spo2Reading")
+    ]
+
     load_balance_map = (training_raw.get("mostRecentTrainingLoadBalance") or {}).get(
         "metricsTrainingLoadBalanceDTOMap"
     ) or {}
@@ -84,6 +96,10 @@ def get_health_snapshot() -> dict:
             "anbefalt_naa_min": next_need.get("baseline"),
             "anbefalt_justert_min": next_need.get("actual"),
             "anbefaling_retning": next_need.get("feedback"),
+            "spo2_snitt": dto.get("averageSpO2Value"),
+            "spo2_laveste": dto.get("lowestSpO2Value"),
+            "spo2_hoyeste": dto.get("highestSpO2Value"),
+            "spo2_natt": spo2_night,
         },
         "hrv": {
             "dato": hrv_day,
@@ -137,12 +153,10 @@ def get_trends(days: int = 14) -> dict:
 
     rhr_rows = client.get_rhr_daily(start_s, end_s) or []
     hrv_rows = (client.get_hrv_data_range(start_s, end_s) or {}).get("hrvSummaries") or []
-    bb_rows = client.get_body_battery(start_s, end_s) or []
 
     return {
         "hvilepuls": {r["calendarDate"]: r.get("value") for r in rhr_rows},
         "hrv": {r["calendarDate"]: r.get("lastNightAvg") for r in hrv_rows},
-        "body_battery_ladet": {r["date"]: r.get("charged") for r in bb_rows},
     }
 
 
@@ -170,10 +184,18 @@ def get_sleep_trend(days: int = 14) -> list[dict]:
 # Garmins egen filter-taksonomi.
 _SPORT_KEYWORDS = {
     "Løping": ["running"],
-    "Sykling": ["cycling", "biking", "bike", "ride"],
+    "Sykling": ["cycling", "biking", "bike", "ride", "spinning"],
     "Svømming": ["swimming"],
     "Styrke": ["strength"],
 }
+
+
+def format_pace(seconds: float | None) -> str | None:
+    """Sekunder → 'm:ss' (tempo vises i minutter og sekunder, ikke desimaltall)."""
+    if not seconds:
+        return None
+    seconds = round(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
 def _categorize(type_key: str | None) -> str:
@@ -196,15 +218,27 @@ def get_activity_history(days: int = 90) -> dict[str, list[dict]]:
     by_sport["Annet"] = []
 
     for a in activities:
-        sport = _categorize((a.get("activityType") or {}).get("typeKey"))
+        type_key = (a.get("activityType") or {}).get("typeKey") or ""
+        sport = _categorize(type_key)
         speed = a.get("averageSpeed") or 0  # m/s
+        pace_sec = 1000 / speed if speed > 0 else None
+        # For bassengsvømming er averageSpeed 0 — regn fart ut fra distanse og svømmetid.
+        distance, moving = a.get("distance"), a.get("movingDuration")
+        swim_speed = distance / moving if distance and moving else 0
         session = {
+            "activity_id": a.get("activityId"),
             "dato": a.get("startTimeLocal"),
             "navn": a.get("activityName"),
+            "type": "Spinning" if ("indoor" in type_key or "spinning" in type_key) and sport == "Sykling" else None,
             "varighet_min": round(a.get("duration", 0) / 60, 1),
             "distanse_km": round(a["distance"] / 1000, 2) if a.get("distance") else None,
-            "tempo_min_per_km": round(1000 / (speed * 60), 2) if speed > 0 else None,
+            "tempo_sek_per_km": pace_sec,
+            "tempo_min_per_km": format_pace(pace_sec),
+            "tempo_per_100m": format_pace(100 / swim_speed) if swim_speed else None,
             "fart_kmh": round(speed * 3.6, 1) if speed > 0 else None,
+            "snitt_watt": a.get("avgPower"),
+            "normalisert_watt": a.get("normPower"),
+            "maks_watt": a.get("maxPower"),
             "snitt_puls": a.get("averageHR"),
             "maks_puls": a.get("maxHR"),
             "kadens": a.get("averageRunningCadenceInStepsPerMinute"),
@@ -254,11 +288,30 @@ def _week_key(session: dict) -> str | None:
     return f"{d.isocalendar().year}-U{d.isocalendar().week:02d}"
 
 
-def weekly_volume(sessions: list[dict], metric: str = "distanse_km") -> dict[str, float]:
-    """Summer `metric` per ISO-uke, for en utviklings-graf per idrett."""
+def _weeks_in_window(days: int) -> list[str]:
+    """Alle ISO-uker de siste `days` dagene, også uker uten økter."""
+    today = date.today()
+    day = today - timedelta(days=days - 1)
+    weeks = []
+    while day <= today:
+        key = _week_key({"dato": day.isoformat()})
+        if key not in weeks:
+            weeks.append(key)
+        day += timedelta(days=1)
+    return weeks
+
+
+def weekly_volume(sessions: list[dict], metric: str = "distanse_km", days: int | None = None) -> dict[str, float]:
+    """Summer `metric` per ISO-uke, for en utviklings-graf per idrett.
+
+    Med `days` tas alle uker i perioden med, også de uten økter (vist som 0) —
+    ellers ser en pauseuke ut som om den aldri fantes.
+    """
     from collections import defaultdict
 
     totals: dict[str, float] = defaultdict(float)
+    for week in _weeks_in_window(days) if days else []:
+        totals[week] = 0.0
     for s in sessions:
         week_key = _week_key(s)
         if week_key:
@@ -266,11 +319,13 @@ def weekly_volume(sessions: list[dict], metric: str = "distanse_km") -> dict[str
     return dict(sorted(totals.items()))
 
 
-def weekly_longest(sessions: list[dict], metric: str = "distanse_km") -> dict[str, float]:
+def weekly_longest(sessions: list[dict], metric: str = "distanse_km", days: int | None = None) -> dict[str, float]:
     """Lengste økt (på `metric`) per ISO-uke — langtur-progresjon."""
     from collections import defaultdict
 
     longest: dict[str, float] = defaultdict(float)
+    for week in _weeks_in_window(days) if days else []:
+        longest[week] = 0.0
     for s in sessions:
         week_key = _week_key(s)
         value = s.get(metric) or 0
@@ -297,7 +352,7 @@ def get_weekly_load_trend(days: int = 90) -> dict[str, float]:
     """
     history = get_activity_history(days=days)
     all_sessions = [s for sessions in history.values() for s in sessions]
-    return weekly_volume(all_sessions, metric="treningsbelastning")
+    return weekly_volume(all_sessions, metric="treningsbelastning", days=days)
 
 
 def get_weekly_training_balance(days: int = 84) -> dict[str, dict[str, float]]:
@@ -306,7 +361,7 @@ def get_weekly_training_balance(days: int = 84) -> dict[str, dict[str, float]]:
     history = get_activity_history(days=days)
     balance: dict[str, dict[str, float]] = {}
     for sport in _SPORT_KEYWORDS:
-        weekly_min = weekly_volume(history.get(sport, []), metric="varighet_min")
+        weekly_min = weekly_volume(history.get(sport, []), metric="varighet_min", days=days)
         balance[sport] = {week: round(minutes / 60, 2) for week, minutes in weekly_min.items()}
     return balance
 
@@ -330,3 +385,54 @@ def get_race_predictions() -> dict[str, str | None]:
         "Halvmaraton": _format_race_time(raw.get("timeHalfMarathon")),
         "Maraton": _format_race_time(raw.get("timeMarathon")),
     }
+
+
+_HR_SPORTS = {"DEFAULT": "Generelt", "RUNNING": "Løping", "CYCLING": "Sykling", "SWIMMING": "Svømming"}
+
+
+@st.cache_data(ttl=REFRESH_SECONDS)
+def get_hr_profile() -> dict[str, dict]:
+    """Pulstall per idrett fra Garmin Connect: makspuls, terskelpuls, hvilepuls
+    og nedre grense for hver pulssone. I tillegg terskeltempo (løping) og FTP
+    (sykling), siden de hører til samme «terskel»-bilde."""
+    client = _client()
+    zone_sets = client.get_heart_rate_zones() or []
+    power_zones = {z.get("sport"): z for z in client.get_power_zones() or []}
+    user = (client.get_user_profile() or {}).get("userData") or {}
+
+    # Garmin lagrer terskelfarten i enheten 10 m/s.
+    lt_speed = user.get("lactateThresholdSpeed")
+    lt_pace = format_pace(1000 / (lt_speed * 10)) if lt_speed else None
+
+    profile = {}
+    for z in zone_sets:
+        sport = _HR_SPORTS.get(z.get("sport"))
+        if not sport:
+            continue
+        profile[sport] = {
+            "makspuls": z.get("maxHeartRateUsed"),
+            "terskelpuls": z.get("lactateThresholdHeartRateUsed"),
+            "hvilepuls": z.get("restingHeartRateUsed"),
+            "soner": {n: z.get(f"zone{n}Floor") for n in range(1, 6)},
+        }
+    if "Løping" in profile:
+        profile["Løping"]["terskeltempo"] = lt_pace
+    if "Sykling" in profile:
+        profile["Sykling"]["ftp"] = (power_zones.get("CYCLING") or {}).get("functionalThresholdPower")
+    return profile
+
+
+@st.cache_data(ttl=REFRESH_SECONDS)
+def get_watch_hr_zones(activity_id: int) -> dict[int, int]:
+    """Pulssonene klokka faktisk brukte i en økt (nedre grense per sone).
+
+    Klokka har egne soner per idrett, og de synkes ikke nødvendigvis til
+    Garmin Connect-profilen — derfor leser vi dem fra en faktisk økt.
+    """
+    zones = _client().get_activity_hr_in_timezones(activity_id) or []
+    return {z["zoneNumber"]: z.get("zoneLowBoundary") for z in zones if z.get("zoneNumber")}
+
+
+def highest_hr(sessions: list[dict]) -> int | None:
+    """Høyeste målte puls blant øktene."""
+    return max((s["maks_puls"] for s in sessions if s.get("maks_puls")), default=None)

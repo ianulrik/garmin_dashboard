@@ -1,5 +1,6 @@
 from datetime import date
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -13,7 +14,86 @@ from data import (
     get_weekly_training_balance,
 )
 from recommendations import RACE_DATE, build_recommendation, training_phase
-from views._common import handle_garmin_errors
+from views._common import handle_garmin_errors, render_overview_hr_numbers
+
+
+# Garmins trainingBalanceFeedbackPhrase → norsk.
+_FOCUS_FEEDBACK = {
+    "BALANCED": "Balansert.",
+    "AEROBIC_LOW_FOCUS": "Fokus på lett aerob.",
+    "AEROBIC_HIGH_FOCUS": "Fokus på høy aerob.",
+    "ANAEROBIC_FOCUS": "Fokus på anaerob.",
+    "AEROBIC_LOW_SHORTAGE": "For lite lett aerob.",
+    "AEROBIC_HIGH_SHORTAGE": "For lite høy aerob.",
+    "ANAEROBIC_SHORTAGE": "For lite anaerob.",
+    "ABOVE_TARGETS": "Over de optimale områdene.",
+    "BELOW_TARGETS": "Under de optimale områdene.",
+    "WITHIN_TARGETS": "Innenfor de optimale områdene.",
+}
+
+
+def _load_focus_chart(manedlig: dict) -> alt.Chart:
+    """Samme graf som «Belastningsfokus» i Garmin-appen: belastning siste 4 uker i
+    anaerob, høy aerob og lett aerob, med optimalt område for hver."""
+    rows = [
+        ("Anaerob", manedlig["anaerob"], *manedlig["anaerob_mal"], "#b45fd6"),
+        ("Høy aerob", manedlig["aerob_hoy"], *manedlig["aerob_hoy_mal"], "#f5a623"),
+        ("Lett aerob", manedlig["aerob_lav"], *manedlig["aerob_lav_mal"], "#2fb5d8"),
+    ]
+    df = pd.DataFrame(rows, columns=["type", "belastning", "min", "maks", "farge"])
+    df["belastning"] = df["belastning"].round()
+    y = alt.Y("type:N", title=None, sort=None, axis=alt.Axis(labelFontSize=13))
+    color = alt.Color("farge:N", scale=None)
+    tooltip = [
+        alt.Tooltip("type:N", title="Type"),
+        alt.Tooltip("belastning:Q", title="Belastning", format=".0f"),
+        alt.Tooltip("min:Q", title="Optimalt fra"),
+        alt.Tooltip("maks:Q", title="Optimalt til"),
+    ]
+    target = (
+        alt.Chart(df)
+        .mark_bar(opacity=0.18, stroke="gray", strokeDash=[4, 3], strokeWidth=1.5, size=34)
+        .encode(y=y, x=alt.X("min:Q", title="Belastning"), x2="maks:Q", color=color, tooltip=tooltip)
+    )
+    bars = alt.Chart(df).mark_bar(size=18, cornerRadiusEnd=4).encode(y=y, x="belastning:Q", color=color, tooltip=tooltip)
+    labels = (
+        alt.Chart(df)
+        .mark_text(align="left", dx=6, fontWeight="bold")
+        .encode(y=y, x="belastning:Q", text=alt.Text("belastning:Q", format=".0f"))
+    )
+    return (target + bars + labels).properties(height=170)
+
+
+def _spo2_chart(readings: list[dict]) -> alt.Chart:
+    df = pd.DataFrame(readings)
+    df["tid"] = pd.to_datetime(df["tid"])
+    return (
+        alt.Chart(df)
+        .mark_line(interpolate="monotone")
+        .encode(
+            x=alt.X("tid:T", title=None, axis=alt.Axis(format="%H:%M")),
+            y=alt.Y("spo2:Q", title="SpO2 (%)", scale=alt.Scale(domain=[min(85, df["spo2"].min()), 100])),
+            tooltip=[alt.Tooltip("tid:T", title="Tid", format="%H:%M"), alt.Tooltip("spo2:Q", title="SpO2 %")],
+        )
+        .properties(height=200)
+    )
+
+
+def _load_chart(load_trend: dict[str, float]) -> alt.Chart:
+    """Søyler for ukentlig belastning + linje for 4-ukers glidende snitt, så brå
+    hopp i belastning skiller seg ut mot det du er vant til."""
+    df = pd.DataFrame({"uke": list(load_trend), "belastning": list(load_trend.values())})
+    df["snitt_4_uker"] = df["belastning"].rolling(4, min_periods=1).mean().round()
+    base = alt.Chart(df).encode(x=alt.X("uke:N", title=None, sort=None))
+    bars = base.mark_bar(opacity=0.7).encode(
+        y=alt.Y("belastning:Q", title="Belastning"),
+        tooltip=[alt.Tooltip("uke:N", title="Uke"), alt.Tooltip("belastning:Q", title="Belastning", format=".0f")],
+    )
+    line = base.mark_line(point=True, color="#e45756").encode(
+        y="snitt_4_uker:Q",
+        tooltip=[alt.Tooltip("uke:N", title="Uke"), alt.Tooltip("snitt_4_uker:Q", title="4-ukers snitt")],
+    )
+    return bars + line
 
 
 @st.fragment(run_every=REFRESH_SECONDS)
@@ -68,6 +148,11 @@ def render() -> None:
 
     st.divider()
 
+    st.subheader("❤️ Puls")
+    render_overview_hr_numbers()
+
+    st.divider()
+
     st.subheader("🔬 Kondisjon (VO2maks)")
     vo2_trend = get_vo2max_trend(months=6)
     loping_vo2 = vo2_trend["loping"]
@@ -106,31 +191,28 @@ def render() -> None:
         balance = get_weekly_training_balance(days=84)
         balance_df = pd.DataFrame(balance).fillna(0.0)
         if not balance_df.empty:
-            st.area_chart(balance_df)
+            # Stablede søyler: hver uke er en egen enhet, og totalhøyden viser ukens samlede timer.
+            st.bar_chart(balance_df, stack=True)
         else:
             st.write("Ingen økter registrert ennå.")
 
     with load_col:
-        st.caption("Ukentlig treningsbelastning, alle idretter (siste 90 dager)")
+        st.caption("Ukentlig treningsbelastning, alle idretter (siste 90 dager) — linjen er 4-ukers snitt")
         load_trend = get_weekly_load_trend(days=90)
         if load_trend:
-            st.bar_chart(pd.Series(load_trend, name="Belastning"))
+            st.altair_chart(_load_chart(load_trend), width="stretch")
         else:
             st.write("Ingen belastningsdata ennå.")
 
     manedlig = trening.get("manedlig_balanse") or {}
-    if manedlig.get("feedback"):
-        feedback_tekst = {
-            "ABOVE_TARGETS": "Over Garmins anbefalte målsoner denne måneden.",
-            "BELOW_TARGETS": "Under Garmins anbefalte målsoner denne måneden.",
-            "WITHIN_TARGETS": "Innenfor Garmins anbefalte målsoner denne måneden.",
-        }
+    if manedlig.get("aerob_lav") is not None:
+        st.markdown("**Belastningsfokus, siste 4 uker**")
+        feedback = manedlig.get("feedback")
         st.caption(
-            f"Garmins månedsvurdering: **{feedback_tekst.get(manedlig['feedback'], manedlig['feedback'])}** "
-            f"(aerob lav {manedlig['aerob_lav']:.0f}, mål {manedlig['aerob_lav_mal'][0]}–{manedlig['aerob_lav_mal'][1]}; "
-            f"aerob høy {manedlig['aerob_hoy']:.0f}, mål {manedlig['aerob_hoy_mal'][0]}–{manedlig['aerob_hoy_mal'][1]}; "
-            f"anaerob {manedlig['anaerob']:.0f}, mål {manedlig['anaerob_mal'][0]}–{manedlig['anaerob_mal'][1]})"
+            f"Garmins vurdering: **{_FOCUS_FEEDBACK.get(feedback, feedback or '—')}** "
+            "Den skraverte boksen er optimalt område for hver type."
         )
+        st.altair_chart(_load_focus_chart(manedlig), width="stretch")
 
     st.divider()
 
@@ -151,6 +233,11 @@ def render() -> None:
         st.write(f"**REM-søvn:** {sovn.get('rem_min', 0):.0f} min")
         st.write(f"**Våken:** {sovn.get('vaken_min', 0):.0f} min ({sovn.get('antall_oppvakninger', 0)} oppvåkninger)")
         st.write(f"**Snitt søvnstress:** {sovn.get('snitt_stress') or '—'}")
+        if sovn.get("spo2_snitt"):
+            st.write(
+                f"**SpO2:** snitt {sovn['spo2_snitt']:.0f} %, laveste {sovn.get('spo2_laveste') or '—'} %, "
+                f"høyeste {sovn.get('spo2_hoyeste') or '—'} %"
+            )
 
     with sleep_col2:
         sleep_df = pd.DataFrame(sleep_trend).set_index("dato")
@@ -164,6 +251,10 @@ def render() -> None:
             st.caption("Søvnscore, siste 30 dager")
             st.line_chart(sleep_df["score"])
 
+        if sovn.get("spo2_natt"):
+            st.caption(f"SpO2 gjennom natta ({sovn['dato']}), %")
+            st.altair_chart(_spo2_chart(sovn["spo2_natt"]), width="stretch")
+
     st.divider()
 
     st.subheader("📈 Trender (siste 30 dager)")
@@ -171,19 +262,15 @@ def render() -> None:
         {
             "Hvilepuls": pd.Series(trends["hvilepuls"]),
             "HRV": pd.Series(trends["hrv"]),
-            "Body Battery (ladet)": pd.Series(trends["body_battery_ladet"]),
         }
     )
     trend_df.index = pd.to_datetime(trend_df.index)
     trend_df = trend_df.sort_index()
 
-    tcol1, tcol2, tcol3 = st.columns(3)
+    tcol1, tcol2 = st.columns(2)
     with tcol1:
         st.caption("Hvilepuls (bpm)")
         st.line_chart(trend_df["Hvilepuls"])
     with tcol2:
         st.caption("HRV, siste natt (ms)")
         st.line_chart(trend_df["HRV"])
-    with tcol3:
-        st.caption("Body Battery ladet (poeng)")
-        st.line_chart(trend_df["Body Battery (ladet)"])

@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Personlige verdier lagt inn i dashbordet (f.eks. CSS)
+innstillinger.json
