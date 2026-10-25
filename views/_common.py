@@ -124,12 +124,13 @@ def render_hr_numbers(sport: str, sessions: list[dict]) -> None:
     if latest_with_hr:
         _zone_caption(get_watch_hr_zones(latest_with_hr["activity_id"]), f"klokka, {sport.lower()}")
     if has_max_setting or sport == "Sykling":
-        editors = st.columns(2 if sport == "Sykling" else 1, width="content")
+        # Samme kolonneoppsett som tallene over, så knappene havner under riktig tall.
+        editors = st.columns(4)
         if has_max_setting:
             with editors[0]:
                 _max_hr_editor(sport, max_hr)
         if sport == "Sykling":
-            with editors[-1]:
+            with editors[len(metrics) - 1]:
                 _ftp_editor(ftp)
 
 
