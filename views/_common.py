@@ -112,8 +112,10 @@ def render_hr_numbers(sport: str, sessions: list[dict]) -> None:
         metrics.append(("Terskelpuls", _bpm(numbers.get("terskelpuls"))))
     if numbers.get("terskeltempo"):
         metrics.append(("Terskeltempo", f"{numbers['terskeltempo']} /km"))
-    if numbers.get("ftp"):
-        metrics.append(("FTP", f"{numbers['ftp']:.0f} W"))
+    # Manuelt lagt inn FTP går foran verdien fra Garmin (som ofte er utdatert).
+    ftp = (load_settings().get("ftp") or numbers.get("ftp")) if sport == "Sykling" else None
+    if sport == "Sykling":
+        metrics.append(("FTP", f"{ftp:.0f} W" if ftp else "—"))
 
     for col, (label, value) in zip(st.columns(4), metrics):
         col.metric(label, value)
@@ -121,8 +123,14 @@ def render_hr_numbers(sport: str, sessions: list[dict]) -> None:
     latest_with_hr = max((s for s in sessions if s.get("snitt_puls")), key=lambda s: s["dato"], default=None)
     if latest_with_hr:
         _zone_caption(get_watch_hr_zones(latest_with_hr["activity_id"]), f"klokka, {sport.lower()}")
-    if has_max_setting:
-        _max_hr_editor(sport, max_hr)
+    if has_max_setting or sport == "Sykling":
+        editors = st.columns(2 if sport == "Sykling" else 1, width="content")
+        if has_max_setting:
+            with editors[0]:
+                _max_hr_editor(sport, max_hr)
+        if sport == "Sykling":
+            with editors[-1]:
+                _ftp_editor(ftp)
 
 
 _MAX_HR_SPORTS = ("Løping", "Sykling", "Svømming")
@@ -138,6 +146,17 @@ def _max_hr_editor(sport: str, current: int | None) -> None:
             max_hr = load_settings().get("makspuls") or {}
             max_hr[sport] = int(new_value)
             save_setting("makspuls", max_hr)
+            st.rerun()
+
+
+def _ftp_editor(current: float | None) -> None:
+    with st.popover("Endre FTP"):
+        st.caption("Overstyrer FTP fra Garmin. Tøm feltet (sett 0) for å bruke Garmin-verdien igjen.")
+        new_value = st.number_input(
+            "FTP (watt)", min_value=0, max_value=600, value=int(current or 0), step=1
+        )
+        if st.button("Lagre", key="lagre_ftp"):
+            save_setting("ftp", int(new_value) or None)
             st.rerun()
 
 
